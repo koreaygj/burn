@@ -98,8 +98,18 @@ impl SystemInfo {
             let lib = env_var_rerun("LIBTORCH_LIB")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| libtorch.clone());
-            libtorch_include_dirs.push(includes.join("include"));
-            libtorch_include_dirs.push(includes.join("include/torch/csrc/api/include"));
+            // When DEP_TCH_LIBTORCH_LIB is propagated from torch-sys it points
+            // at .../libtorch/lib; the headers live in the parent's `include`.
+            let include_root = if includes.ends_with("lib") {
+                includes
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or(includes)
+            } else {
+                includes
+            };
+            libtorch_include_dirs.push(include_root.join("include"));
+            libtorch_include_dirs.push(include_root.join("include/torch/csrc/api/include"));
             if lib.ends_with("lib") {
                 // DEP_TCH_LIBTORCH_LIB might already point to /lib
                 libtorch_lib_dir = Some(lib);
@@ -144,7 +154,9 @@ impl SystemInfo {
         } else {
             "src/cuda_hack/fake_cuda_dependency.cpp"
         };
+        let conv_backward = "src/cpp/conv_backward.cpp";
         println!("cargo:rerun-if-changed={cuda_dependency}");
+        println!("cargo:rerun-if-changed={conv_backward}");
 
         match self.os {
             Os::Linux | Os::Macos => {
@@ -156,7 +168,7 @@ impl SystemInfo {
                     .flag(format!("-Wl,-rpath={}", self.libtorch_lib_dir.display()))
                     .flag("-std=c++17")
                     .flag(format!("-D_GLIBCXX_USE_CXX11_ABI={}", self.cxx11_abi))
-                    .files(&[cuda_dependency])
+                    .files(&[cuda_dependency, conv_backward])
                     .compile("burn-tch");
             }
             Os::Windows => {
@@ -166,7 +178,7 @@ impl SystemInfo {
                     .warnings(false)
                     .includes(&self.libtorch_include_dirs)
                     .flag("/std:c++17")
-                    .files(&[cuda_dependency])
+                    .files(&[cuda_dependency, conv_backward])
                     .compile("burn-tch");
             }
         };

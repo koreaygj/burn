@@ -1656,6 +1656,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cnn_min_repro"
+version = "0.21.0-pre.3"
+dependencies = [
+ "burn",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "codespan-reporting"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

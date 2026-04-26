@@ -8,6 +8,107 @@ use burn_backend::{
     },
     tensor::FloatTensor,
 };
+use std::os::raw::c_int;
+use torch_sys::C_tensor;
+
+unsafe extern "C" {
+    fn burn_tch_convolution_backward(
+        out__: *mut *mut C_tensor,
+        grad_output: *mut C_tensor,
+        input: *mut C_tensor,
+        weight: *mut C_tensor,
+        bias_sizes_data: *const i64,
+        bias_sizes_len: usize,
+        has_bias_sizes: c_int,
+        stride_data: *const i64,
+        stride_len: usize,
+        padding_data: *const i64,
+        padding_len: usize,
+        dilation_data: *const i64,
+        dilation_len: usize,
+        transposed: c_int,
+        output_padding_data: *const i64,
+        output_padding_len: usize,
+        groups: i64,
+        input_mask: c_int,
+        weight_mask: c_int,
+        bias_mask: c_int,
+    );
+}
+
+/// Safe wrapper around `at::convolution_backward`.
+///
+/// `output_mask` selects which gradients to compute; the corresponding tensor
+/// in the returned tuple is `Some` only if its mask bit was true and libtorch
+/// returned a defined tensor. The returned tensors are taken ownership of from
+/// the heap pointers allocated on the C++ side via shallow_clone + `at_free`.
+#[allow(clippy::too_many_arguments)]
+fn convolution_backward(
+    grad_output: &tch::Tensor,
+    input: &tch::Tensor,
+    weight: &tch::Tensor,
+    bias_sizes: Option<&[i64]>,
+    stride: &[i64],
+    padding: &[i64],
+    dilation: &[i64],
+    transposed: bool,
+    output_padding: &[i64],
+    groups: i64,
+    input_mask: bool,
+    weight_mask: bool,
+    bias_mask: bool,
+) -> (
+    Option<tch::Tensor>,
+    Option<tch::Tensor>,
+    Option<tch::Tensor>,
+) {
+    let mut out: [*mut C_tensor; 3] = [std::ptr::null_mut(); 3];
+    let (bias_sizes_ptr, bias_sizes_len, has_bias) = match bias_sizes {
+        Some(s) => (s.as_ptr(), s.len(), 1 as c_int),
+        None => (std::ptr::null(), 0, 0 as c_int),
+    };
+
+    unsafe {
+        burn_tch_convolution_backward(
+            out.as_mut_ptr(),
+            grad_output.as_ptr() as *mut C_tensor,
+            input.as_ptr() as *mut C_tensor,
+            weight.as_ptr() as *mut C_tensor,
+            bias_sizes_ptr,
+            bias_sizes_len,
+            has_bias,
+            stride.as_ptr(),
+            stride.len(),
+            padding.as_ptr(),
+            padding.len(),
+            dilation.as_ptr(),
+            dilation.len(),
+            transposed as c_int,
+            output_padding.as_ptr(),
+            output_padding.len(),
+            groups,
+            input_mask as c_int,
+            weight_mask as c_int,
+            bias_mask as c_int,
+        );
+    }
+
+    let take = |p: *mut C_tensor| -> Option<tch::Tensor> {
+        if p.is_null() {
+            None
+        } else {
+            // SAFETY: p was returned by `new torch::Tensor(...)` on the C++ side
+            // and ownership is transferred to us. clone_from_ptr does a refcount
+            // bump (shallow_clone) producing a valid wrapper; we then free the
+            // original heap-allocated wrapper to balance the `new`.
+            let t = unsafe { tch::Tensor::clone_from_ptr(p) };
+            unsafe { torch_sys::at_free(p) };
+            Some(t)
+        }
+    };
+
+    (take(out[0]), take(out[1]), take(out[2]))
+}
 
 impl<E: TchElement> ModuleOps<Self> for LibTorch<E> {
     fn embedding(weights: TchTensor, indices: TchTensor) -> TchTensor {
@@ -96,6 +197,72 @@ impl<E: TchElement> ModuleOps<Self> for LibTorch<E> {
         );
 
         TchTensor::new(tensor)
+    }
+
+    fn conv2d_x_backward(
+        x: TchTensor,
+        weight: TchTensor,
+        output_grad: TchTensor,
+        options: ConvOptions<2>,
+    ) -> TchTensor {
+        let stride = options.stride.map(|i| i as i64);
+        let padding = options.padding.map(|i| i as i64);
+        let dilation = options.dilation.map(|i| i as i64);
+        let output_padding = [0i64, 0];
+
+        let (x_grad, _, _) = convolution_backward(
+            &output_grad.tensor,
+            &x.tensor,
+            &weight.tensor,
+            None,
+            &stride,
+            &padding,
+            &dilation,
+            false,
+            &output_padding,
+            options.groups as i64,
+            true,
+            false,
+            false,
+        );
+        TchTensor::new(x_grad.expect("convolution_backward returned no input grad"))
+    }
+
+    fn conv2d_weight_backward(
+        x: TchTensor,
+        weight: TchTensor,
+        output_grad: TchTensor,
+        options: ConvOptions<2>,
+    ) -> TchTensor {
+        let stride = options.stride.map(|i| i as i64);
+        let padding = options.padding.map(|i| i as i64);
+        let dilation = options.dilation.map(|i| i as i64);
+        let output_padding = [0i64, 0];
+
+        let (_, w_grad, _) = convolution_backward(
+            &output_grad.tensor,
+            &x.tensor,
+            &weight.tensor,
+            None,
+            &stride,
+            &padding,
+            &dilation,
+            false,
+            &output_padding,
+            options.groups as i64,
+            false,
+            true,
+            false,
+        );
+        TchTensor::new(w_grad.expect("convolution_backward returned no weight grad"))
+    }
+
+    fn conv2d_bias_backward(_x: TchTensor, _bias: TchTensor, output_grad: TchTensor) -> TchTensor {
+        let kind = output_grad.tensor.kind();
+        let grad = output_grad
+            .tensor
+            .sum_dim_intlist(Some([0_i64, 2, 3].as_slice()), false, kind);
+        TchTensor::new(grad)
     }
 
     fn conv3d(
